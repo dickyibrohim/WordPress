@@ -2,7 +2,7 @@
 Please backup your database and WP first. There is no guarantee this will run smoothly even though I have tried to succeed. All at your own risk
 
 Put it in functions.php child theme or active theme. Then check the list of posts in wp-admin. Then delete the code again.
-Video test: https://www.youtube.com/watch?v=NDaWaPkxApQ
+Video test: https://www.youtube.com/watch?v=rA8c1SZ1Vuw
 */
 
 $args = array(
