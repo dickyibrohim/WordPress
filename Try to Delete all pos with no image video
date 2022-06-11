@@ -3,6 +3,9 @@ Please backup your database and WP first. There is no guarantee this will run sm
 
 Put it in functions.php child theme or active theme. Then check the list of posts in wp-admin. Then delete the code again.
 Video test: https://www.youtube.com/watch?v=rA8c1SZ1Vuw
+
+Be careful, on very many article posts, it can cause error 524: A timeout occurred. 
+This happens because the database query is generated to handle all posts until it reaches its limit / overloaded
 */
 
 $args = array(
