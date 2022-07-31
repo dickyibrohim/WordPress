@@ -1,0 +1,22 @@
+function change_placeholder_title_cpt( $title ){
+$screen = get_current_screen();
+  if ( 'YOUR-CUSTOM-FIELD-HERE' == $screen->post_type ){
+    $title = 'change with new place holder for title here';
+  }
+return $title;
+}
+add_filter( 'enter_title_here', 'change_placeholder_title_cpt' );
+
+
+/*if not work, try this one*/
+ add_filter('enter_title_here', 'change_placeholder_title_cpt_here' ,20 , 2 );
+    function change_placeholder_title_cpt_here($title , $post){
+
+        if( $post->post_type == 'YOUR-CUSTOM-FIELD-HERE' ){
+            $my_title = "change with new place holder for title here";
+            return $my_title;
+        }
+
+     return $title;
+
+}
