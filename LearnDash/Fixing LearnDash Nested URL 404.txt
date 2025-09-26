@@ -1,13 +1,11 @@
 /**
- * LearnDash Nested URL Mapper — Polylang-aware, parent-validated, no rewrites.
- * v5 — Strict CPT resolution + parent chain validation to prevent “lesson rendered on topic URL”.
+ * LearnDash Nested URL Mapper — v7
+ * Polylang-aware, strict CPT + parent validation, access-aware, and LD-route redirect guard.
  *
- * Supported (language prefix optional):
- *   /{lang}/courses/{course}/
- *   /{lang}/courses/{course}/lessons/{lesson}/
- *   /{lang}/courses/{course}/lessons/{lesson}/topics/{topic}/
- *   /{lang}/courses/{course}/lessons/{lesson}/quizzes/{quiz}/
- *   /{lang}/courses/{course}/quizzes/{quiz}/
+ * Goals:
+ * - Enrolled users: render the exact lesson/topic/quiz (no rewrites, no loops).
+ * - Guests / not-enrolled users: prevent LD-route⇄LD-route ping-pong by normalizing
+ *   any LD-route redirect to a single gate URL (login or the course permalink).
  */
 
 if (!defined('ABSPATH')) exit;
@@ -18,7 +16,6 @@ $GLOBALS['LD_MAPPED_THIS_REQUEST'] = false;
  * Helpers (route, parse, ACL)
  * -------------------------*/
 
-/** True if current request targets an LD route (/ {lang?} /courses / …) */
 function ld_is_ld_route_uri($uri = null) {
     if ($uri === null) $uri = $_SERVER['REQUEST_URI'] ?? '';
     if ($uri === '' || strpos($uri, '/wp-json') === 0) return false;
@@ -27,13 +24,7 @@ function ld_is_ld_route_uri($uri = null) {
     return (bool) preg_match('~^/(?:[a-z]{2}(?:-[a-z]{2})?/)?courses(?:/|$)~i', $path);
 }
 
-/**
- * Parse /courses/... and extract parts:
- * returns [
- *   lang, course_slug, marker ('', 'lessons','topics','quizzes'),
- *   lesson_slug (when present), final_slug (course|lesson|topic|quiz)
- * ]
- */
+/** Parse /courses/... into pieces */
 function ld_parse_parts() {
     $path = parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH);
     if (!$path) return null;
@@ -54,57 +45,48 @@ function ld_parse_parts() {
         'final_slug'  => '',
     ];
 
-    // Need at least /courses/{course}
     if (empty($parts[$i+1])) return null;
     $out['course_slug'] = $parts[$i+1];
 
-    // Only /courses/{course}
     if (!isset($parts[$i+2])) {
-        $out['final_slug'] = $out['course_slug'];
+        $out['final_slug'] = $out['course_slug']; // course page
         return $out;
     }
 
-    // /courses/{course}/{marker}/{child?}
     $marker = $parts[$i+2];
     $out['marker'] = $marker;
 
     if ($marker === 'lessons') {
-        // /courses/{course}/lessons/{lesson}
         $out['lesson_slug'] = $parts[$i+3] ?? '';
         if (!$out['lesson_slug']) return null;
 
-        // /topics/{topic} or /quizzes/{quiz} after lesson?
         if (isset($parts[$i+4])) {
             $submarker = $parts[$i+4];
             $child     = $parts[$i+5] ?? '';
             if ($submarker === 'topics' && $child) {
                 $out['marker']     = 'topics';
-                $out['final_slug'] = $child;            // topic slug
+                $out['final_slug'] = $child; // topic
             } elseif ($submarker === 'quizzes' && $child) {
                 $out['marker']     = 'quizzes';
-                $out['final_slug'] = $child;            // quiz slug (under lesson)
+                $out['final_slug'] = $child; // quiz under lesson
             } else {
-                // just lesson
-                $out['final_slug'] = $out['lesson_slug'];
+                $out['final_slug'] = $out['lesson_slug']; // lesson
             }
         } else {
-            // just lesson
-            $out['final_slug'] = $out['lesson_slug'];
+            $out['final_slug'] = $out['lesson_slug']; // lesson
         }
     } elseif ($marker === 'quizzes') {
-        // /courses/{course}/quizzes/{quiz} (direct under course)
         $quiz = $parts[$i+3] ?? '';
         if (!$quiz) return null;
-        $out['final_slug'] = $quiz;
+        $out['final_slug'] = $quiz; // quiz directly under course
     } else {
-        // Unexpected marker; treat last segment as final
         $out['final_slug'] = end($parts);
     }
 
     return $out;
 }
 
-/** Quick access check using LearnDash if available */
+/** LearnDash access checks */
 function ld_user_has_access_to_step($post_id) {
     if (function_exists('sfwd_lms_has_access')) {
         return (bool) sfwd_lms_has_access($post_id, get_current_user_id());
@@ -112,54 +94,44 @@ function ld_user_has_access_to_step($post_id) {
     return is_user_logged_in();
 }
 
-/** Get course ID for any LD post (course/lesson/topic/quiz) */
+/** Relation helpers (prefer LD, fallback meta/parent) */
 function ld_get_course_id_fallback($post_id) {
-    // Prefer LearnDash helper if present
     if (function_exists('learndash_get_course_id')) {
         $cid = learndash_get_course_id($post_id);
         if ($cid) return (int) $cid;
     }
-    // Fallback meta keys frequently used by LD
-    $meta_keys = ['course_id', 'ld_course_id', 'sfwd-courses'];
-    foreach ($meta_keys as $k) {
+    foreach (['course_id','ld_course_id','sfwd-courses'] as $k) {
         $v = get_post_meta($post_id, $k, true);
         if ($v) return (int) $v;
     }
-    // Climb up parent chain if any
     $p = (int) get_post_field('post_parent', $post_id);
     if ($p) return ld_get_course_id_fallback($p);
     return 0;
 }
-
-/** Get lesson ID for a topic/quiz if set */
 function ld_get_lesson_id_fallback($post_id) {
     if (function_exists('learndash_get_lesson_id')) {
         $lid = learndash_get_lesson_id($post_id);
         if ($lid) return (int) $lid;
     }
-    $keys = ['lesson_id', 'ld_lesson_id', 'sfwd-lessons'];
-    foreach ($keys as $k) {
+    foreach (['lesson_id','ld_lesson_id','sfwd-lessons'] as $k) {
         $v = get_post_meta($post_id, $k, true);
         if ($v) return (int) $v;
     }
     return 0;
 }
-
-/** Get topic ID for a quiz if set (some quizzes belong to topics) */
 function ld_get_topic_id_fallback($post_id) {
     if (function_exists('learndash_get_topic_id')) {
         $tid = learndash_get_topic_id($post_id);
         if ($tid) return (int) $tid;
     }
-    $keys = ['topic_id', 'ld_topic_id', 'sfwd-topic'];
-    foreach ($keys as $k) {
+    foreach (['topic_id','ld_topic_id','sfwd-topic'] as $k) {
         $v = get_post_meta($post_id, $k, true);
         if ($v) return (int) $v;
     }
     return 0;
 }
 
-/** Query a single post by slug & lang for a specific CPT only */
+/** Strict single by slug/lang/CPT */
 function ld_get_single_by_slug_lang_cpt($slug, $cpt, $lang) {
     $args = [
         'post_type'      => $cpt,
@@ -178,6 +150,23 @@ function ld_get_single_by_slug_lang_cpt($slug, $cpt, $lang) {
     return $id;
 }
 
+/** Build a stable "gate" URL for users without access */
+function ld_gate_url_for($course_id, $lang) {
+    // If not logged in, prefer login with redirect_to back to current URL
+    if (!is_user_logged_in()) {
+        $current = (is_ssl() ? 'https://' : 'http://') . ($_SERVER['HTTP_HOST'] ?? '') . ($_SERVER['REQUEST_URI'] ?? '/');
+        return wp_login_url($current);
+    }
+    // Logged in but not enrolled → send to course permalink (Polylang handles lang)
+    $u = get_permalink($course_id);
+    if ($u && !empty($lang) && function_exists('pll_get_post')) {
+        // Ensure course URL in the requested language (if translation exists)
+        $tr = pll_get_post($course_id, $lang);
+        if ($tr) $u = get_permalink($tr);
+    }
+    return $u ?: home_url('/');
+}
+
 /* ------------------------------------------------
  * 1) Early mapping in `request` (strict + validated)
  * ------------------------------------------------*/
@@ -188,122 +177,141 @@ add_filter('request', function ($query_vars) {
     $p = ld_parse_parts();
     if (!$p) return $query_vars;
 
-    // Switch Polylang context if language prefix exists (no redirect)
-    if (!empty($p['lang']) && function_exists('pll_switch_language')) {
-        pll_switch_language($p['lang']);
-        add_filter('pll_redirect_canonical', '__return_false', 99);
-    }
-
-    // Resolve course first (needed for validation)
+    // Resolve course first (strict)
     $course_id = ld_get_single_by_slug_lang_cpt($p['course_slug'], 'sfwd-courses', $p['lang']);
     if (!$course_id) return $query_vars;
 
     $target_id = 0;
     $target_pt = 'sfwd-courses';
 
-    // Decide target by marker with strict CPT and validate parent chain
     if ($p['marker'] === 'topics' && $p['lesson_slug'] && $p['final_slug']) {
-        // Resolve lesson under course
         $lesson_id = ld_get_single_by_slug_lang_cpt($p['lesson_slug'], 'sfwd-lessons', $p['lang']);
-        if ($lesson_id) {
-            // Ensure lesson's course matches the course in URL
-            $lesson_course_id = ld_get_course_id_fallback($lesson_id);
-            if ($lesson_course_id === $course_id) {
-                // Resolve topic
-                $topic_id = ld_get_single_by_slug_lang_cpt($p['final_slug'], 'sfwd-topic', $p['lang']);
-                if ($topic_id) {
-                    // Validate topic -> lesson & course
-                    $topic_lesson_id = ld_get_lesson_id_fallback($topic_id);
-                    $topic_course_id = ld_get_course_id_fallback($topic_id);
-                    if (($topic_lesson_id === $lesson_id) && ($topic_course_id === $course_id)) {
-                        $target_id = $topic_id;
-                        $target_pt = 'sfwd-topic';
-                    }
+        if ($lesson_id && ld_get_course_id_fallback($lesson_id) === $course_id) {
+            $topic_id = ld_get_single_by_slug_lang_cpt($p['final_slug'], 'sfwd-topic', $p['lang']);
+            if ($topic_id) {
+                $topic_lesson_id = ld_get_lesson_id_fallback($topic_id);
+                $topic_course_id = ld_get_course_id_fallback($topic_id);
+                if ($topic_lesson_id === $lesson_id && $topic_course_id === $course_id) {
+                    $target_id = $topic_id;
+                    $target_pt = 'sfwd-topic';
                 }
             }
         }
     } elseif ($p['marker'] === 'quizzes' && $p['final_slug']) {
-        // Two possibilities: quiz under lesson or quiz directly under course.
         $quiz_id = ld_get_single_by_slug_lang_cpt($p['final_slug'], 'sfwd-quiz', $p['lang']);
-        if ($quiz_id) {
-            $quiz_course_id = ld_get_course_id_fallback($quiz_id);
-            if ($quiz_course_id === $course_id) {
-                if ($p['lesson_slug']) {
-                    // If lesson is present in URL, validate against lesson/topic parent
-                    $lesson_id = ld_get_single_by_slug_lang_cpt($p['lesson_slug'], 'sfwd-lessons', $p['lang']);
-                    if ($lesson_id) {
-                        $quiz_lesson_id = ld_get_lesson_id_fallback($quiz_id);
-                        // Accept if quiz belongs to that lesson; if not set, allow (some quizzes attach differently)
-                        if ($quiz_lesson_id === 0 || $quiz_lesson_id === $lesson_id) {
-                            $target_id = $quiz_id;
-                            $target_pt = 'sfwd-quiz';
-                        }
+        if ($quiz_id && ld_get_course_id_fallback($quiz_id) === $course_id) {
+            if ($p['lesson_slug']) {
+                $lesson_id = ld_get_single_by_slug_lang_cpt($p['lesson_slug'], 'sfwd-lessons', $p['lang']);
+                if ($lesson_id) {
+                    $quiz_lesson_id = ld_get_lesson_id_fallback($quiz_id);
+                    if ($quiz_lesson_id === 0 || $quiz_lesson_id === $lesson_id) {
+                        $target_id = $quiz_id;
+                        $target_pt = 'sfwd-quiz';
                     }
-                } else {
-                    // Quiz under course directly (no lesson in URL)
-                    $target_id = $quiz_id;
-                    $target_pt = 'sfwd-quiz';
                 }
+            } else {
+                $target_id = $quiz_id;
+                $target_pt = 'sfwd-quiz';
             }
         }
     } elseif ($p['marker'] === 'lessons' && $p['lesson_slug']) {
         $lesson_id = ld_get_single_by_slug_lang_cpt($p['lesson_slug'], 'sfwd-lessons', $p['lang']);
-        if ($lesson_id) {
-            $lesson_course_id = ld_get_course_id_fallback($lesson_id);
-            if ($lesson_course_id === $course_id) {
-                $target_id = $lesson_id;
-                $target_pt = 'sfwd-lessons';
-            }
+        if ($lesson_id && ld_get_course_id_fallback($lesson_id) === $course_id) {
+            $target_id = $lesson_id;
+            $target_pt = 'sfwd-lessons';
         }
     } else {
-        // Course landing
         $target_id = $course_id;
         $target_pt = 'sfwd-courses';
     }
 
-    if (!$target_id) return $query_vars; // Leave WP to handle (could 404/redirect as LD intends)
+    if (!$target_id) return $query_vars;
 
-    // Access gating only for child steps
+    // If child step and user has no access → do NOT map; let LD redirect later
     $is_child = in_array($target_pt, ['sfwd-lessons','sfwd-topic','sfwd-quiz'], true);
     if ($is_child && !ld_user_has_access_to_step($target_id)) {
-        // Don’t map; let LearnDash redirect cleanly (prevents loops)
         return $query_vars;
     }
 
-    // Map to a canonical single query for the exact target (no redirect)
+    // We WILL map (enrolled users / course page) → switch Polylang context and suppress canonicals
+    if (!empty($p['lang']) && function_exists('pll_switch_language')) {
+        pll_switch_language($p['lang']);
+        add_filter('pll_redirect_canonical', '__return_false', 99);
+    }
+
     $target = get_post($target_id);
     if (!$target) return $query_vars;
 
-    $mapped = [
+    $GLOBALS['LD_MAPPED_THIS_REQUEST'] = true;
+
+    return array_merge($query_vars, [
         'p'         => $target_id,
         'post_type' => $target_pt,
         'name'      => $target->post_name,
         'error'     => '',
-    ];
-
-    $GLOBALS['LD_MAPPED_THIS_REQUEST'] = true;
-    return array_merge($query_vars, $mapped);
+    ]);
 }, 0);
 
 /* -----------------------------------------------------------------
- * 2) Suppress canonicals/redirects ONLY when we actually mapped
+ * 2) Redirect guard (break LD-route⇄LD-route ping-pong for no-access)
  * ----------------------------------------------------------------*/
 
-add_action('template_redirect', function () {
+add_action('init', function () {
+    // Always allow non-LD routes to behave normally.
     if (!ld_is_ld_route_uri()) return;
 
-    if ($GLOBALS['LD_MAPPED_THIS_REQUEST']) {
-        remove_action('template_redirect', 'redirect_canonical');
-        add_filter('redirect_canonical', '__return_false', 99);
-        if (function_exists('pll_the_languages')) {
-            add_filter('pll_redirect_canonical', '__return_false', 99);
+    add_filter('wp_redirect', function ($location, $status) {
+        // If redirecting to a non-LD route, allow.
+        if (!ld_is_ld_route_uri($location)) return $location;
+
+        // We’re redirecting to another LD route. Decide whether to normalize.
+        $p = ld_parse_parts();
+        if (!$p) return $location;
+
+        // Resolve the course to build a stable gate URL
+        $course_id = ld_get_single_by_slug_lang_cpt($p['course_slug'], 'sfwd-courses', $p['lang']);
+        if (!$course_id) return $location;
+
+        // If we already mapped (enrolled users), allow the redirect unless it’s another LD route ping-pong
+        if ($GLOBALS['LD_MAPPED_THIS_REQUEST']) {
+            // Allow login/enroll/account flows
+            $loc_path = parse_url($location, PHP_URL_PATH) ?: '';
+            foreach (['login','enroll','my-account','checkout','cart'] as $k) {
+                if (stripos($loc_path, $k) !== false) return $location;
+            }
+            // Block LD→LD hop: stay on current (no redirect)
+            return false;
         }
+
+        // Not mapped (guest/not-enrolled). Normalize any LD→LD redirect to a single gate URL.
+        $gate = ld_gate_url_for($course_id, $p['lang']);
+        if (!$gate) return $location;
+
+        // Avoid self-redirect
+        $curr = (is_ssl() ? 'https://' : 'http://') . ($_SERVER['HTTP_HOST'] ?? '') . ($_SERVER['REQUEST_URI'] ?? '/');
+        if (trailingslashit($gate) === trailingslashit($curr)) {
+            return false;
+        }
+        return $gate;
+    }, 0, 2);
+});
+
+/* ------------------------------------------------------
+ * 3) Suppress canonicals only when we actually mapped
+ * -----------------------------------------------------*/
+
+add_action('template_redirect', function () {
+    if (!$GLOBALS['LD_MAPPED_THIS_REQUEST']) return;
+
+    remove_action('template_redirect', 'redirect_canonical');
+    add_filter('redirect_canonical', '__return_false', 99);
+    if (function_exists('pll_the_languages')) {
+        add_filter('pll_redirect_canonical', '__return_false', 99);
     }
 
-    // Debug headers
     if (!headers_sent()) {
         header('X-LD-Route: 1');
-        header('X-LD-Mapped: ' . ($GLOBALS['LD_MAPPED_THIS_REQUEST'] ? '1' : '0'));
+        header('X-LD-Mapped: 1');
         if (is_singular() && ($obj = get_queried_object()) instanceof WP_Post) {
             header('X-LD-Object: ' . $obj->post_type . '#' . $obj->ID);
         }
