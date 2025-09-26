@@ -1,0 +1,277 @@
+/**
+ * LearnDash Nested URL Loader — Polylang-aware, no rewrites, no redirects.
+ *
+ * Purpose:
+ * - Serve LearnDash objects (course/lesson/topic/quiz) from nested URLs like:
+ *     /{lang}/courses/{course}/
+ *     /{lang}/courses/{course}/lessons/{lesson}/
+ *     /{lang}/courses/{course}/lessons/{lesson}/topics/{topic}/
+ *     /{lang}/courses/{course}/lessons/{lesson}/quizzes/{quiz}/
+ *     /{lang}/courses/{course}/quizzes/{quiz}/
+ *   (language prefix optional)
+ *
+ * How it works:
+ * - When WordPress is about to return 404 on a /courses/... path, we:
+ *   1) Parse the URL, detect optional language prefix, and extract the final slug.
+ *   2) Resolve the slug to the correct LearnDash post in the proper language.
+ *   3) Prime the global query to render that single post (no redirect).
+ *
+ * Benefits:
+ * - No custom rewrite rules needed (avoids canonical/Polylang loops).
+ * - Works for guests, regular users, and admins.
+ * - Plays nicely with LearnDash access control (login/course redirects still
+ *   happen normally at render time, not as infinite loops).
+ */
+
+if (!defined('ABSPATH')) exit;
+
+/* ======================
+ * Route detection helper
+ * ======================*/
+
+/**
+ * Returns true if the current request URI looks like a LearnDash route:
+ * /{lang?}/courses/...
+ */
+function ld_is_ld_route_uri($uri = null) {
+    if ($uri === null) $uri = $_SERVER['REQUEST_URI'] ?? '';
+    if ($uri === '' || strpos($uri, '/wp-json') === 0) return false;
+
+    $path = parse_url($uri, PHP_URL_PATH);
+    if (!$path) return false;
+
+    // Matches /de/courses/... or /en-us/courses/... or simply /courses/...
+    return (bool) preg_match('~^/(?:[a-z]{2}(?:-[a-z]{2})?/)?courses(?:/|$)~i', $path);
+}
+
+/* =========================================
+ * Kill canonical redirects on LD routes only
+ * =========================================*/
+
+/**
+ * Disable canonical redirects early on LD routes and log any redirect attempts
+ * to help trace external redirect sources (SEO/security plugins, etc.).
+ */
+add_action('init', function () {
+    if (!ld_is_ld_route_uri()) return;
+
+    // Disable WP canonical redirect for this request
+    add_filter('redirect_canonical', '__return_false', 0);
+
+    // Disable Polylang canonical redirect for this request (if Polylang is active)
+    if (function_exists('pll_the_languages')) {
+        add_filter('pll_redirect_canonical', '__return_false', 0);
+    }
+
+    // Block any wp_redirect() on LD routes to prevent loops and log the attempt
+    add_filter('wp_redirect', function ($location, $status) {
+        if (!ld_is_ld_route_uri()) return $location;
+
+        // Debug logging (enable WP_DEBUG + WP_DEBUG_LOG to see entries)
+        if (defined('WP_DEBUG') && WP_DEBUG) {
+            error_log('[LD-ROUTE] wp_redirect attempted → ' . $location . ' (' . $status . ') :: ' . wp_debug_backtrace_summary());
+        }
+
+        // If you want to allow exactly one login redirect, uncomment:
+        // if (strpos($location, '/login') !== false) return $location;
+
+        // Block redirects on LD routes (prevents infinite loops)
+        return false;
+    }, 0, 2);
+});
+
+/**
+ * Remove late canonical redirects and set debug headers.
+ */
+add_action('template_redirect', function () {
+    if (!ld_is_ld_route_uri() || is_admin()) return;
+
+    // Remove WP core canonical redirect attached in template_redirect
+    remove_action('template_redirect', 'redirect_canonical');
+
+    // Double-suppress any remaining canonical redirects
+    add_filter('redirect_canonical', '__return_false', 99);
+    if (function_exists('pll_the_languages')) {
+        add_filter('pll_redirect_canonical', '__return_false', 99);
+    }
+
+    // Debug headers (view in DevTools → Network)
+    if (!headers_sent()) {
+        header('X-LD-Route: 1');
+        header('X-LD-ReqURI: ' . ($_SERVER['REQUEST_URI'] ?? ''));
+    }
+}, 0);
+
+/* ===========================
+ * URL parser + post resolver
+ * ===========================*/
+
+/**
+ * Parse current /courses/... path:
+ * - Extract optional language prefix (xx or xx-yy).
+ * - Determine the final slug and a priority list of CPTs to try.
+ */
+function ld_parse_ld_route_from_uri() {
+    $path = parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH);
+    if (!$path) return null;
+    $path = rtrim($path, '/');
+
+    // Optional language prefix: /de/, /en-us/, etc.
+    if (!preg_match('~^/(?:([a-z]{2}(?:-[a-z]{2})?)/)?courses(?:/|$)~i', $path, $m)) return null;
+    $lang = isset($m[1]) ? strtolower($m[1]) : '';
+
+    $parts = array_values(array_filter(explode('/', $path), 'strlen'));
+    $i = array_search('courses', $parts, true);
+    if ($i === false) return null;
+
+    $out = ['lang' => $lang, 'slug' => '', 'prio' => []];
+
+    // /.../courses/{course}
+    if (count($parts) === $i + 2) {
+        $out['slug'] = $parts[$i + 1];
+        $out['prio'] = ['sfwd-courses'];
+        return $out;
+    }
+
+    $marker = $parts[$i + 2] ?? '';
+    $child  = $parts[$i + 3] ?? '';
+
+    $map = [
+        'lessons'  => 'sfwd-lessons',
+        'topics'   => 'sfwd-topic',
+        'quizzes'  => 'sfwd-quiz',
+    ];
+
+    if (isset($map[$marker]) && $child) {
+        // We have an explicit marker and a child slug
+        $out['slug'] = $child;
+        $primary = $map[$marker];
+
+        // Priority: marker CPT first, then other LD types (tunable)
+        $out['prio'] = array_values(array_unique([
+            $primary, 'sfwd-topic', 'sfwd-lessons', 'sfwd-quiz', 'sfwd-courses'
+        ]));
+    } else {
+        // Fallback: use the last segment and a generic priority
+        $out['slug'] = end($parts);
+        $out['prio'] = ['sfwd-topic', 'sfwd-lessons', 'sfwd-quiz', 'sfwd-courses'];
+    }
+    return $out;
+}
+
+/**
+ * Find a single post by slug across a list of CPTs, optionally constrained
+ * to a Polylang language (when a lang prefix is present).
+ */
+function ld_find_post_by_slug_and_lang($slug, $cpts, $lang) {
+    if (!$slug || empty($cpts)) return 0;
+
+    foreach ($cpts as $pt) {
+        $args = [
+            'post_type'      => $pt,
+            'name'           => $slug,
+            'post_status'    => 'publish',
+            'fields'         => 'ids',
+            'posts_per_page' => 1,
+            'no_found_rows'  => true,
+        ];
+
+        // If Polylang is active, constrain to the requested lang (if provided).
+        if (function_exists('pll_the_languages')) {
+            // '' means "current language"; when prefix exists, use it directly.
+            $args['lang'] = $lang ?: '';
+        }
+
+        $q = new WP_Query($args);
+        if ($q->have_posts()) {
+            $id = (int) $q->posts[0];
+            wp_reset_postdata();
+            return $id;
+        }
+        wp_reset_postdata();
+    }
+    return 0;
+}
+
+/* =========================
+ * Prime a single post query
+ * =========================*/
+
+/**
+ * Convert the current request into a normal single post render
+ * for the resolved LearnDash object (no redirect).
+ */
+function ld_prime_single_query($post_id) {
+    global $wp_query, $post;
+
+    // Extra safety: ensure no canonical redirect gets added later
+    remove_action('template_redirect', 'redirect_canonical');
+    add_filter('redirect_canonical', '__return_false', 99);
+    if (function_exists('pll_the_languages')) {
+        add_filter('pll_redirect_canonical', '__return_false', 99);
+    }
+
+    $the_post = get_post($post_id);
+    if (!$the_post) return false;
+
+    // Initialize the main query to a valid single
+    $wp_query->init();
+    $wp_query->is_home     = false;
+    $wp_query->is_page     = false;
+    $wp_query->is_single   = true;
+    $wp_query->is_singular = true;
+    $wp_query->is_404      = false;
+
+    $wp_query->queried_object    = $the_post;
+    $wp_query->queried_object_id = $post_id;
+    $wp_query->post              = $the_post;
+    $wp_query->posts             = [$the_post];
+    $wp_query->found_posts       = 1;
+    $wp_query->post_count        = 1;
+
+    // Minimal query vars so templates/loaders behave normally
+    $wp_query->query_vars['p']         = $post_id;
+    $wp_query->query_vars['post_type'] = $the_post->post_type;
+    $wp_query->query_vars['name']      = $the_post->post_name;
+
+    // Set global $post
+    $post = $the_post;
+    setup_postdata($post);
+
+    // Debug header to confirm resolution
+    if (!headers_sent()) {
+        header('X-LD-Resolved: ' . $the_post->post_type . '#' . $post_id);
+    }
+    return true;
+}
+
+/* ================================================
+ * Core: intercept 404 → resolve → render (no redirect)
+ * ================================================*/
+
+/**
+ * If WordPress is about to 404 on a LearnDash route, resolve the object
+ * and render it directly. This avoids both 404 and redirect loops.
+ */
+add_filter('pre_handle_404', function ($preempt, $wp_query) {
+    if (is_admin() || !$wp_query->is_404 || !ld_is_ld_route_uri()) return $preempt;
+
+    $parsed = ld_parse_ld_route_from_uri();
+    if (!$parsed) return $preempt;
+
+    // If a language prefix is present, switch Polylang context (no redirect)
+    if (!empty($parsed['lang']) && function_exists('pll_switch_language')) {
+        pll_switch_language($parsed['lang']);
+        add_filter('pll_redirect_canonical', '__return_false', 99);
+    }
+
+    // Resolve final slug to a LearnDash post in the appropriate language
+    $post_id = ld_find_post_by_slug_and_lang($parsed['slug'], $parsed['prio'], $parsed['lang']);
+    if (!$post_id) return $preempt; // allow the original 404 if not found
+
+    // Prime the query to render the single post normally
+    if (!ld_prime_single_query($post_id)) return $preempt;
+
+    // Tell WP we've handled the 404 (return true to short-circuit 404 handling)
+    return true;
+}, 0, 2);
