@@ -1,0 +1,1 @@
+Manual: WooCommerce → Settings → Tax → (bagian bawah) Price display suffix
