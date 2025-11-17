@@ -1,6 +1,5 @@
 ### Hi there 👋
-- 🔭 I’m currently managing PT. CLEOVA INOVASI TEKNOLOGI
-- 💬 Ask me about WordPress and WooCommerce
+- 💬 Ask me about Ai, WordPress, and WooCommerce
 - 📫 How to reach me: support@cleova.com
 
 ### Support Me
